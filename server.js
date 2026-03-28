@@ -23,64 +23,14 @@ wss.on("connection", (ws) => {
 
   function send(text, endCall = false) {
     responseId++;
-    const msg = {
+    ws.send(JSON.stringify({
       response_type: "response",
       response_id: responseId,
       content: text,
       content_complete: true,
       end_call: endCall,
-    };
-    ws.send(JSON.stringify(msg));
+    }));
     console.log("[Bridge] -> Retell:", text.substring(0, 120));
-  }
-
-  async function callN8n(phone) {
-    console.log("[Bridge] Calling n8n with phone:", phone || "(none)");
-
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 20000);
-
-    try {
-      const res = await fetch(N8N_WEBHOOK_URL, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        signal: controller.signal,
-        body: JSON.stringify({
-          call_id: callId,
-          phone_number: phone,
-          email_id: "",
-          conversation_transcript: transcript,
-        }),
-      });
-
-      clearTimeout(timeout);
-      const raw = await res.text();
-      console.log("[Bridge] n8n response:", raw.substring(0, 300));
-
-      let text = "";
-      try {
-        const parsed = JSON.parse(raw);
-        text = parsed.response || parsed.output_response || parsed.content || "";
-      } catch {
-        text = raw.trim();
-      }
-
-      return text || null;
-
-    } catch (err) {
-      clearTimeout(timeout);
-      console.error("[Bridge] n8n error:", err.message);
-      return null;
-    }
-  }
-
-  function extractPhone(text) {
-    const match = text.match(/\+?1?\s*\(?\d{3}\)?[\s.\-]?\d{3}[\s.\-]?\d{4}/);
-    if (!match) return "";
-    const digits = match[0].replace(/\D/g, "");
-    if (digits.length === 10) return "+1" + digits;
-    if (digits.length === 11) return "+" + digits;
-    return "";
   }
 
   ws.on("message", async (data) => {
@@ -92,7 +42,6 @@ wss.on("connection", (ws) => {
 
     if (msg.call?.call_id) callId = msg.call.call_id;
 
-    // Update transcript on every event
     if (msg.transcript?.length) {
       transcript = msg.transcript.map((t) => `${t.role}: ${t.content}`).join("\n");
     }
@@ -102,31 +51,57 @@ wss.on("connection", (ws) => {
       return;
     }
 
-    // Send greeting immediately when call starts
+    // Instant greeting on call start
     if (type === "call_details" && !greetingSent) {
       greetingSent = true;
-      setTimeout(() => send(GREETING), 500);
+      setTimeout(() => send(GREETING), 300);
       return;
     }
 
     if (type === "response_required" || type === "reminder_required") {
-      const phone = extractPhone(transcript);
-      const response = await callN8n(phone);
+      console.log("[Bridge] Transcript:\n", transcript);
 
-      if (response && response.trim() !== "") {
-        send(response);
-      } else {
-        // n8n returned nothing — run a fallback based on context
-        if (!phone) {
-          send("I didn't quite catch that. Could you please give me your phone number?");
-        } else {
-          send("I couldn't find a booking with that number. Could you double-check the number for me?");
+      try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 25000);
+
+        const res = await fetch(N8N_WEBHOOK_URL, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          signal: controller.signal,
+          body: JSON.stringify({
+            call_id: callId,
+            phone_number: "",
+            email_id: "",
+            conversation_transcript: transcript,
+          }),
+        });
+
+        clearTimeout(timeout);
+        const raw = await res.text();
+        console.log("[Bridge] n8n response:", raw.substring(0, 300));
+
+        let text = "";
+        try {
+          const parsed = JSON.parse(raw);
+          text = parsed.response || parsed.output_response || parsed.content || "";
+        } catch {
+          text = raw.trim();
         }
+
+        send(text || "Could you please repeat that?");
+
+      } catch (err) {
+        console.error("[Bridge] Error:", err.message);
+        send(err.name === "AbortError"
+          ? "I'm still looking that up, just a moment."
+          : "Could you please repeat that?"
+        );
       }
     }
   });
 
-  ws.on("close", () => console.log("[Bridge] Call ended:", callId));
+  ws.on("close", () => console.log("[Bridge] Ended:", callId));
   ws.on("error", (err) => console.error("[Bridge] WS error:", err.message));
 });
 
